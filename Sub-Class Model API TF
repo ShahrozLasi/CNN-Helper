@@ -358,5 +358,17 @@ class ImageDatasetCreator:
         return self.test.batch(self.batch).repeat()
 
 
+def load_images(directory):
+    data = []
+    labels  = []
+    for f in os.listdir(directory):
+        data_path = os.path.join(directory, f)
+        files = glob.glob(data_path+'/*.jpg')
+        for file in files:
+            img = cv2.imread(file)
+            img = cv2.resize(img, (IMG_SIZE,IMG_SIZE))
+            data.append(img)
+            labels.append(f)
 
+    return np.array(data), np.array(labels)
 
