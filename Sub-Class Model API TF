@@ -1,0 +1,362 @@
+from __future__ import absolute_import, division, print_function, unicode_literals
+import os
+import glob
+import cv2
+import tensorflow as tf
+# import tensorflow_datasets as tfds
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Conv2D, Flatten, Dropout, MaxPooling2D, GlobalAveragePooling2D, BatchNormalization
+from sklearn import preprocessing
+import numpy as np
+
+
+def batch_norm(x, n_out, training=False):
+
+    beta = tf.Variable(tf.constant(0.0, shape=[n_out]), name='beta', trainable=True)
+    gamma = tf.Variable(tf.constant(1.0, shape=[n_out]), name='gamma', trainable=True)
+
+    batch_mean, batch_var = tf.nn.moments(x, [0, 1, 2], name='moments')
+    ema = tf.train.ExponentialMovingAverage(decay=0.5)
+
+    def mean_var_with_update():
+        ema_apply_op = ema.apply([batch_mean, batch_var])
+        with tf.control_dependencies([ema_apply_op]):
+            return tf.identity(batch_mean), tf.identity(batch_var)
+
+    mean, var = tf.cond(training, mean_var_with_update, lambda: (ema.average(batch_mean), ema.average(batch_var)))
+    normed = tf.nn.batch_normalization(x, mean, var, beta, gamma, epsilon=1e-3)
+
+    return normed
+
+class globalaveragepooling(tf.keras.layers.Layer):  ## Not Correct --> check the n_channels
+    def __init__(self):
+        super(globalaveragepooling, self).__init__()
+
+    def call(self, x):
+        ## Transpose to [batch_size, height, num_channles, width]
+        self.input_t = tf.transpose(x, [0, 1, 3, 2])
+        # Get the value of num_channels
+        self.num_channels = self.input_t.get_shape().as_list()[2]
+        # Compute mean using tf.nn.avg_pool
+        self.avg = tf.nn.avg_pool(input=self.input_t,
+                                  ksize=[1, 1, self.num_channels, 1],
+                                  strides=[1, 1, self.num_channels, 1],
+                                  padding='SAME')
+
+        # Transpose back to original form
+        self.input_tt = tf.transpose(self.avg, [0, 1, 3, 2])
+
+        return self.input_tt
+
+
+class conv2d(tf.keras.layers.Layer):
+    # @classmethod
+    # def imagenet_intializer(cls, kernel_intializer, bias_initializer):
+    #     """Add the weights from other dataset to initialize
+    #        the weights for this model
+    #        (dataset has to be trained on similar architecture)
+    #        """
+    #     if kernel_intializer in None:
+    #         print('No initializer')
+    #     return kernel_intializer, bias_initializer
+    def __init__(self, filter_size=3, n_filters=16, strides=1, padding='VALID',
+                 kernel_initializer = None):
+        super(conv2d, self).__init__()
+        self.filter_size = filter_size
+        self.n_filters = n_filters
+        self.strides = strides
+        self.padding = padding
+        self.kernel_initializer = kernel_initializer
+
+    def build(self, input_shape):
+
+        if self.kernel_initializer is None:
+            w_init = tf.initializers.GlorotNormal(seed=0)
+            self.w = tf.Variable(initial_value=w_init(shape=(self.filter_size, self.filter_size,
+                                                         input_shape[-1], self.n_filters),
+                                                  dtype='float32'), trainable=True)
+        else:
+            # Simply pass your init here
+            self.w = self.add_weight(shape = (self.filter_size, self.filter_size,
+                                              input_shape[-1], self.n_filters),
+                                     initializer=self.kernel_initializer,
+                                     trainable= True)
+
+        b_init = tf.zeros_initializer()
+        self.b = tf.Variable(initial_value=b_init(shape=(self.n_filters,),
+                                                  dtype='float32'), trainable=True)
+
+    def call(self, inputs):
+        self.x = tf.nn.conv2d(inputs, self.w, strides=[1, self.strides, self.strides, 1], padding=self.padding)
+        self.x = tf.nn.bias_add(self.x, self.b)
+        return self.x
+
+
+class batch_norm(tf.keras.layers.Layer):
+    def __init(self):
+        super(batch_norm).__init__()
+
+    def build(self, input_shape):
+        self.beta = tf.Variable(tf.constant(0.0, shape=[input_shape[-1]]),
+                                name='beta', trainable=True)
+        self.gamma = tf.Variable(tf.constant(1.0, shape=[input_shape[-1]]),
+                                 name='gamma', trainable=True)
+
+    def call(self, batch, training = False):
+        batch_mean, batch_var = tf.nn.moments(batch, [0], name='moments')  # Axis to normalize across
+        batch_normed = tf.nn.batch_normalization(batch, batch_mean, batch_var, self.beta,
+                                                 self.gamma, 0.0001, name='batch_normalization')
+        return batch_normed
+
+class maxpool2d(tf.keras.layers.Layer):
+    def __init__(self, k=2, s=2, padding='VALID'):
+        super(maxpool2d, self).__init__()
+        self.k = k
+        self.s = s
+        self.padding = padding
+
+    def call(self, x):
+        return tf.nn.max_pool(x, ksize=[1, self.k, self.k, 1], strides=[1, self.s, self.s, 1], padding=self.padding)
+
+## Dense Layer
+class FullyConnectedLayer(tf.keras.layers.Layer):
+    def __init__(self, units=32, kernel_initializer = None):
+        super(FullyConnectedLayer, self).__init__()
+        self.units = units
+        self.kernel_initializer = kernel_initializer
+
+    def build(self, input_shape):
+
+        if self.kernel_initializer is not None:
+            # Simply pass your init here
+            self.weight = tf.Variable(initial_value = self.kernel_initializer, trainable = True)
+
+        else:
+            # Create a trainable weight variable for this layer
+            w_init = tf.keras.initializers.glorot_uniform(seed= 0)
+            self.weight = tf.Variable(initial_value=w_init(shape=(input_shape[-1], self.units),
+                                                  dtype='float32'),trainable=True)
+        # Bias does't need to be pre-trained
+        self.bias = self.add_weight(shape=([self.units]),
+                                        initializer='zero',
+                                        trainable=True)
+
+    def call(self, inputs):
+        linarg = tf.add(tf.matmul(inputs, self.weight), self.bias)
+        return tf.nn.relu(linarg)
+
+## Output Layer
+class OutLayer(tf.keras.layers.Layer):
+    """ The # of classes are different in each dataset,
+        output layer weights should not be initialized.
+    """
+    def __init__(self, units=32):
+        super(OutLayer, self).__init__()
+        self.units = units
+
+    def build(self, input_shape):
+        w_init = tf.keras.initializers.glorot_uniform(seed=0)
+        self.weight = tf.Variable(initial_value=w_init(shape=(input_shape[-1], self.units),
+                                                       dtype='float32'), trainable=True)
+
+        self.bias = self.add_weight(shape = ([self.units]),
+                                    initializer='zero',
+                                    trainable=True)
+    def call(self, inputs):
+        linarg = tf.add(tf.matmul(inputs, self.weight), self.bias)
+        return tf.nn.softmax(linarg)
+
+
+class Relu(tf.keras.layers.Layer):
+
+    def call(self, inputs):
+        return tf.nn.relu(inputs)
+
+
+class Conv_Edge(tf.keras.Model):
+    def __init__(self, n_classes=10, IMG_SIZE=150, kernel = None):
+        """ kernel is dictionaries with keys as layer numbers (strings)"""
+        super(Conv_Edge, self).__init__()
+        self.n_classes = n_classes
+        self.IMG_SIZE = IMG_SIZE
+        self.kernel = kernel
+
+        if kernel is not None:
+            ## Use the init here
+            # First Conv
+            self.conv1 = conv2d(n_filters=16, kernel_initializer= self.kernel["1"])
+            # self.batch1 = batch_norm()
+            self.batch1 = BatchNormalization()
+            self.relu1 = Relu()
+            self.pool1 = maxpool2d(2, s=2)
+            # Second Conv
+            self.conv2 = conv2d(n_filters=32, kernel_initializer= self.kernel["5"])
+            # self.batch2 = batch_norm()
+            self.batch2 = BatchNormalization()
+            self.relu2 = Relu()
+            self.pool2 = maxpool2d(2, s=2)
+            # Third Conv
+            self.conv3 = conv2d(n_filters=64, kernel_initializer= self.kernel['9'])
+            # self.batch3 = batch_norm()
+            self.batch3 = BatchNormalization()
+            self.relu3 = Relu()
+            self.pool3 = maxpool2d(2, s=2)
+            # Fourth Conv
+            self.conv4 = conv2d(n_filters=128, kernel_initializer= self.kernel['13'])
+            # self.batch4 = batch_norm()
+            self.batch4 = BatchNormalization()
+            self.relu4 = Relu()
+            self.pool4 = maxpool2d(2, s=2)
+            # Global average
+            self.avg1 = GlobalAveragePooling2D()
+            #         self.avg1 = globalaveragepooling()
+            # Dense Layer
+            self.dense1 = FullyConnectedLayer(50, kernel_initializer= self.kernel['18'])
+            self.dropout = Dropout(0.2)
+            # Output Layer
+            self.out = OutLayer(self.n_classes)
+        else:
+            # First Conv
+            self.conv1 = conv2d(n_filters=16)
+            # self.batch1 = batch_norm()
+            self.batch1 = BatchNormalization()
+            self.relu1 = Relu()
+            self.pool1 = maxpool2d(2, s=2)
+            # Second Conv
+            self.conv2 = conv2d(n_filters=32)
+            # self.batch2 = batch_norm()
+            self.batch2 = BatchNormalization()
+            self.relu2 = Relu()
+            self.pool2 = maxpool2d(2, s=2)
+            # Third Conv
+            self.conv3 = conv2d(n_filters=64)
+            # self.batch3 = batch_norm()
+            self.batch3 = BatchNormalization()
+            self.relu3 = Relu()
+            self.pool3 = maxpool2d(2, s=2)
+            # Fourth Conv
+            self.conv4 = conv2d(n_filters=128)
+            # self.batch4 = batch_norm()
+            self.batch4 = BatchNormalization()
+            self.relu4 = Relu()
+            self.pool4 = maxpool2d(2, s=2)
+            # Global average
+            self.avg1 = GlobalAveragePooling2D()
+            #         self.avg1 = globalaveragepooling()
+            # Dense Layer
+            self.dense1 = FullyConnectedLayer(50)
+            self.dropout = Dropout(0.2)
+            # Output Layer
+            self.out = OutLayer(self.n_classes)
+
+    def call(self, inputs, training = False):
+        # First Layer
+        x = self.conv1(inputs)
+        x = self.batch1(x, training = training)
+        x = self.relu1(x)
+        x = self.pool1(x)
+        # Second Layer
+        x = self.conv2(x)
+        x = self.batch2(x, training = training)
+        x = self.relu2(x)
+        x = self.pool2(x)
+        # Third Layer
+        x = self.conv3(x)
+        x = self.batch3(x, training = training)
+        x = self.relu3(x)
+        x = self.pool3(x)
+        # Fourth Layers
+        x = self.conv4(x)
+        x = self.batch4(x, training = training)
+        x = self.relu4(x)
+        x = self.pool4(x)
+        # Global average pooling
+        x = self.avg1(x)
+        # Dense Layer
+        x = self.dense1(x)
+        x = tf.nn.relu(x)
+        # Dropout Layer
+        x = self.dropout(x, training = training)
+        # Output Layer
+        x = self.out(x)
+        return x
+
+class Trainer:
+    def __init__(self, model, optimizer, loss_function):
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_function = loss_function
+
+        self.train_loss =  tf.keras.metrics.Mean(name = "train_loss")
+        self.train_acc = tf.keras.metrics.CategoricalAccuracy()
+        self.test_acc   =  tf.keras.metrics.Accuracy()
+        self.loss_history = []
+
+    def train_step(self, images, labels):
+        with tf.GradientTape() as tape:
+            # Get current predictions of network
+            logits = self.model(images, training = True)
+            # Calculate loss generated by prediction
+            loss = self.loss_function(labels, logits)
+
+        # Append the losses
+        self.loss_history.append(loss.numpy().mean())
+        # Get the gradients of loss
+        gradients = tape.gradient(loss, self.model.trainable_variables)
+        # apply optimizer to move in the descent direction
+        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        # Record the loss
+        self.train_loss(loss)
+        # self.train_acc.update_state(labels, logits)
+    def train(self, images, labels, epochs):
+        for epoch in epoch:
+            # For N epochs iterate over dataset and perform train steps each time
+            self.train_step(images,labels)
+
+    def test_step(self,x,y):
+        # Record test accuracy separately
+        logits = self.model(x, training = False)
+        prediction = tf.argmax(logits, axis =1)
+        self.test_acc(prediction, tf.argmax(y, axis=1))
+
+    def test(self, dataset):
+        for x,y in dataset:
+            self.test_step(x,y)
+
+    def __str__(self):
+        # Just return metrics
+        return f"Train Loss: {self.train_loss.result()}, Train Acc: {self.train_acc.result()}"
+class ImageDatasetCreator:
+    @classmethod
+    def _convert_image_dtype(cls, dataset):
+        return dataset.map(lambda image, label:(
+            tf.image.convert_image_dtype(image, tf.float32),
+            label
+        ))
+
+    def __init__(self, name:str, batch:int, cache:bool = True, split = None):
+        # Load dataset, every dataset has default train, test split
+        dataset = tfds.load(name, as_supervised = True, split = split)
+        # Convert to float range
+        try:
+            self.train = ImageDatasetCreator._convert_image_dtype(dataset['train'])
+            self.test  = ImageDatasetCreator._convert_image_dtype(dataset['test'])
+        except KeyError as exception:
+            raise ValueError(
+                f"Dataset {name} does not have train and test, write your own custom dataset handler"
+            )from exception
+        if cache:
+            self.train = self.train.cache() # speed things up considerably
+            self.test  = self.test.cache()
+
+        self.batch: int = batch
+
+    def get_train(self):
+        return self.train.shuffle().batch(self.batch).repeat()
+
+    def get_test(self):
+        return self.test.batch(self.batch).repeat()
+
+
+
+
